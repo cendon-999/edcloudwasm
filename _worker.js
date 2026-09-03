@@ -1430,21 +1430,16 @@ const manualPipe = async (readable, writable, close, speed) => {
     const flushBuffer = () => {
         if (isReading) return needsFlush = true;
         fastFlush = offset < fastFlushOffset;
-        if (offset > 0) {
-            offset > safeBufferSize
-                ? (writable.send(bufferView.subarray(0, offset)), bufferView = new Uint8Array(pipeBufferSize))
-                : writable.send(bufferView.slice(0, offset));
-            offset = 0;
-        }
+        if (offset > 0) (writable.send(bufferView.subarray(0, offset)), offset = 0);
         needsFlush = false, protectFlush = false, timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
     try {
         while (true) {
-            const useSpare = offset > 0 && protectFlush;
-            let readBuffer = bufferView.buffer, readOffset = offset;
-            isReading = offset > 0;
-            useSpare && (readBuffer = spareBuffer, readOffset = 0, isReading = false);
+            let readBuffer, readOffset, useSpare = offset > 0 && protectFlush;
+            useSpare
+                ? (readBuffer = spareBuffer, readOffset = 0, isReading = false)
+                : (readBuffer = bufferView.buffer, readOffset = offset, isReading = offset > 0);
             const {done, value} = await reader.read(new Uint8Array(readBuffer, readOffset, maxChunkLen));
             isReading = false;
             useSpare ? (bufferView.set(value, offset), spareBuffer = value.buffer) : (bufferView = new Uint8Array(value.buffer));
@@ -1593,7 +1588,7 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         if (!tcpResult) return close();
         state.tcpSocket = tcpResult.socket;
         const tcpWriter = state.tcpSocket.writable.getWriter();
-        const bufferedTcpWriter = createBufferedTcpWriter(tcpWriter, close);
+        const bufferedTcpWriter = state.xwebPipeTo ? null : createBufferedTcpWriter(tcpWriter, close);
         if (payload.byteLength) tcpWriter.write(payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
@@ -1616,9 +1611,9 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
                 }, close, tcpResult.speed);
             })().catch(close);
         } else {
-            state.tcpWriter = bufferedTcpWriter;
             if (state.tcpSocket.extra?.length) await writable.send(state.tcpSocket.extra);
-            if (state.xwebPipeTo) return;
+            if (state.xwebPipeTo) return tcpWriter.releaseLock();
+            state.tcpWriter = bufferedTcpWriter;
             manualPipe(state.tcpSocket.readable, writable, close, tcpResult.speed);
         }
     }
@@ -1652,7 +1647,7 @@ const handleXwebPost = async (request) => {
     const reader = request.body?.getReader({mode: 'byob'});
     if (!reader) return new Response(null, {status: 400});
     const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true, xwebPipeTo: true};
-    const bridge = new IdentityTransformStream(), responseWriter = bridge.writable.getWriter();
+    const bridge = new IdentityTransformStream(undefined, {highWaterMark: 64 * 1024 * 1024}), upBridge = new IdentityTransformStream(undefined, {highWaterMark: 1024 * 1024 * 1024}), responseWriter = bridge.writable.getWriter();
     let xwebBuffer = new ArrayBuffer(8192), used = 0;
     const close = () => {if (state.xwebPipeTo) responseWriter.close().catch(() => {})};
     const writable = {send(chunk) {if (chunk?.byteLength) return responseWriter.write(chunk)}};
@@ -1662,18 +1657,16 @@ const handleXwebPost = async (request) => {
             if (done) return close();
             xwebBuffer = value.buffer, used += value.byteLength;
             const payload = new Uint8Array(xwebBuffer, 0, used);
-            if (state.tcpWriter) {
-                await state.tcpWriter(payload.slice());
-                used = 0;
-            } else {
-                state.needMore = false;
-                await handleSession(payload, state, request, writable, close);
-                if (state.tcpSocket && state.xwebPipeTo) {
-                    state.xwebPipeTo = false, responseWriter.releaseLock();
-                    state.tcpSocket.readable.pipeTo(bridge.writable).catch(close);
-                }
-                if (!state.needMore) used = 0;
+            state.needMore = false;
+            await handleSession(payload, state, request, writable, close);
+            if (state.tcpSocket && state.xwebPipeTo) {
+                state.xwebPipeTo = false, responseWriter.releaseLock(), reader.releaseLock();
+                state.tcpSocket.readable.pipeTo(bridge.writable).catch(close);
+                request.body.pipeTo(upBridge.writable).catch(close);
+                upBridge.readable.pipeTo(state.tcpSocket.writable).catch(close);
+                break;
             }
+            if (!state.needMore) used = 0;
         }
     })().catch(close);
     return new Response(bridge.readable, {headers: xwebHeaders});
@@ -1743,7 +1736,7 @@ const getSub = async (request, url, uuid) => {
 export default {
     async fetch(request, env) {
         if (!isInitialized) initializeWasm(env);
-        if (request.method === 'POST' && request.headers.get('content-type') === 'application/grpc-web') return handleXwebPost(request);
+        if (request.method === 'POST' && request.headers.get('content-type')?.startsWith('application/grpc')) return handleXwebPost(request);
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
             webSocket.accept({allowHalfOpen: true}), webSocket.binaryType = "arraybuffer";
